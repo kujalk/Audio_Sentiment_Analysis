@@ -1,0 +1,381 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Template to create an S3 bucket, a Lambda function, and a DynamoDB table.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: The name of the project
+    Default: Audio-Sentiment-Analysis
+  S3BucketName:
+    Type: String
+    Description: The name of the S3 Bucket
+
+
+Resources:
+  S3Bucket:
+    Type: 'AWS::S3::Bucket'
+    DependsOn : LambdaInvokePermission
+    Properties:
+      BucketName: !Ref S3BucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: 'prefix'
+                    Value: 'sourcefiles/'
+                  - Name: 'suffix'
+                    Value: '.mp3'
+            Function: !GetAtt LambdaFunction.Arn
+          - Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: 'prefix'
+                    Value: 'transcribedfiles/'
+                  - Name: 'suffix'
+                    Value: '.json'
+            Function: !GetAtt LambdaFunction.Arn
+      
+
+  # IAM Role for Lambda Function
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-LambdaRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: !Sub "${ProjectName}-LambdaS3TranscribeComprehendPolicy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                Resource: !Sub 'arn:aws:s3:::${S3BucketName}/*'
+              - Effect: 'Allow'
+                Action:
+                  - 'transcribe:StartTranscriptionJob'
+                  - 'comprehend:DetectSentiment'
+                Resource: '*'
+              - Effect: 'Allow'
+                Action:
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:PutItem'
+                Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-FileTracker'
+              - Effect: 'Allow'
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+              - Effect: 'Allow'
+                Action:
+                  - 'iam:PassRole'
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-TranscriberRole'
+
+  TranscriberExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties: 
+      RoleName: !Sub '${ProjectName}-TranscriberRole'
+      AssumeRolePolicyDocument: 
+        Version: '2012-10-17'
+        Statement: 
+          - Effect: 'Allow'
+            Principal: 
+              Service: 'transcribe.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies: 
+        - PolicyName: !Sub "${ProjectName}-Transcriber-policy"
+          PolicyDocument: 
+            Version: '2012-10-17'
+            Statement: 
+              - Effect: 'Allow'
+                Action: 
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                Resource: !Sub 'arn:aws:s3:::${S3BucketName}/*'
+              
+  # DynamoDB Table
+  DynamoDBTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: !Sub "${ProjectName}-FileTracker"
+      AttributeDefinitions:
+        - AttributeName: 'FileName'
+          AttributeType: 'S'
+        - AttributeName: 'Date'
+          AttributeType: 'S'
+      KeySchema:
+        - AttributeName: 'FileName'
+          KeyType: 'HASH'
+        - AttributeName: 'Date'
+          KeyType: 'RANGE'
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  # Lambda Function
+  LambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-lambda'
+      Timeout: 900
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: 'python3.10'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib.parse
+          from botocore.exceptions import BotoCoreError, ClientError
+          from datetime import datetime
+          import os
+          import uuid
+
+          s3_client = boto3.client('s3')
+          transcribe_client = boto3.client('transcribe')
+          dynamodb_client = boto3.client('dynamodb')
+          comprehend_client = boto3.client('comprehend')
+
+
+          def Comprehendjob(bucket: str,key: str) -> dict:
+              
+              # Generate a unique job name using the file name
+              job_name = key.split('/')[-1].split('.')[0]
+              db_key = job_name.split('_')[0]
+              db_sort_key = job_name.split('_')[1]
+              job_uri = f's3://{bucket}/{key}'
+              
+              print(f"Job name is {job_name} and Full file path is {job_uri}")
+
+              # Get the transcribed text from S3
+              try:
+                  response = s3_client.get_object(Bucket=bucket, Key=key)
+                  transcribed_data = json.loads(response['Body'].read().decode('utf-8'))
+                  transcript = transcribed_data['results']['transcripts'][0]['transcript']
+              except Exception as e:
+                  print(f"Error getting object {key} from bucket {bucket}. Error: {e}")
+                  raise e
+
+              # Send the text to Comprehend for sentiment analysis
+              try:
+                  sentiment_response = comprehend_client.detect_sentiment(Text=transcript, LanguageCode='en')
+                  sentiment = sentiment_response['Sentiment']
+                  sentiment_scores = sentiment_response['SentimentScore']
+
+                  print(f"Sentiment of the file {job_uri} is {sentiment}")
+
+              except Exception as e:
+                  print(f"Error analyzing sentiment with Comprehend for job {job_name}. Error: {e}")
+                  raise e
+              
+              # Update DynamoDB with sentiment analysis results
+              try:
+                  print(f"Updating the Dynomo DB table with Comprehend result for {job_name} with key {db_key} and sort key {db_sort_key}")
+
+                  dynamodb_client.update_item(
+                      TableName=os.getenv("DynamoTableName"),  # Replace with your DynamoDB table name
+                      Key={
+                          'FileName': {'S': db_key},
+                          'Date': {'S': db_sort_key}
+                      },
+                      UpdateExpression="SET #status = :status, #sentiment = :sentiment, #scores = :scores",
+                      ExpressionAttributeNames={
+                          '#status': 'Status',
+                          '#sentiment': 'Sentiment',
+                          '#scores': 'SentimentScores'
+                      },
+                      ExpressionAttributeValues={
+                          ':status': {'S': 'Sentiment Analysis Completed'},
+                          ':sentiment': {'S': sentiment},
+                          ':scores': {'M': {
+                              'Positive': {'N': str(sentiment_scores['Positive'])},
+                              'Negative': {'N': str(sentiment_scores['Negative'])},
+                              'Neutral': {'N': str(sentiment_scores['Neutral'])},
+                              'Mixed': {'N': str(sentiment_scores['Mixed'])}
+                          }}
+                      }
+                  )
+
+                  print(f"Successfully updated the Dynomo DB table with Comprehend result for {job_name}")
+
+              except Exception as e:
+                  print(f"Error updating DynamoDB table for {job_name}: {e}")
+                  raise e
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(f'Sentiment analysis completed and result stored successfully for job {job_name}!')
+              }
+              
+          def TranscribeJob(bucket: str,key: str) -> dict:
+
+              # Generate a unique job name using the file name
+              job_name = key.split('/')[-1].split('.')[0]
+              job_uri = f's3://{bucket}/{key}'
+              formatted_date = datetime.now().strftime('%Y-%m-%d')
+              
+              random_uuid = uuid.uuid4().hex
+              
+              # Start the transcription job with JobExecutionSettings and IdentifyLanguage
+              try:
+                  transcribe_client.start_transcription_job(
+                      TranscriptionJobName=f"job_name_{random_uuid[:16]}",
+                      Media={'MediaFileUri': job_uri},
+                      MediaFormat=key.split('.')[-1],
+                      IdentifyLanguage=True,
+                      JobExecutionSettings={
+                          'AllowDeferredExecution': True,
+                          'DataAccessRoleArn': os.getenv("TranscribeRoleARN")
+                      },
+                      OutputBucketName=bucket,
+                      OutputKey=f'transcribedfiles/{job_name}_{formatted_date}.json'
+                  )
+              except (BotoCoreError, ClientError) as error:
+                  print(f"Error starting transcription job: {error}")
+                  raise error
+              
+              # Store details in DynamoDB
+              try:
+                  print(f"DynamoDB status is going to update for Transcribe job {job_name}")
+                  dynamodb_client.put_item(
+                      TableName=os.getenv("DynamoTableName"),
+                      Item={
+                          'FileName': {'S': job_name},
+                          'Date': {'S': formatted_date},
+                          'BucketName': {'S': bucket},
+                          'Status': {'S': 'Triggered Transcribe Job'},
+                          
+                      }
+                  )
+                  print(f"DynamoDB status is updated successfully for Transcribe job {job_name}")
+              except (BotoCoreError, ClientError) as error:
+                  print(f"Error storing details in DynamoDB for job {job_name}: {error}")
+                  raise error
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(f'Transcription job started and details stored in DynamoDB successfullyfor job {job_name}!')
+              }
+              
+          def lambda_handler(event, context):
+              
+              try:
+                  # Get the bucket and file name from the event
+                  bucket = event['Records'][0]['s3']['bucket']['name']
+                  key = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'], encoding='utf-8')
+                  
+                  folder = key.split('/')[0]
+                  print(f"Lambda is triggered due to bucket {bucket} and key {key}")
+
+                  if folder == "sourcefiles":
+                      return TranscribeJob(bucket,key)
+                  else:
+                      return Comprehendjob(bucket,key)
+              except Exception as e:
+                  print(f"Error caught while triggering the lambda - {e}")
+
+      
+      Environment:
+        Variables:
+          DynamoTableName: !Sub "${ProjectName}-FileTracker"
+          TranscribeRoleARN: !GetAtt TranscriberExecutionRole.Arn
+
+      
+
+  # Lambda Permission to Allow S3 to Invoke Lambda
+  LambdaInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref LambdaFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 's3.amazonaws.com'
+      SourceArn: !Sub 'arn:aws:s3:::${S3BucketName}'
+      SourceAccount: !Ref "AWS::AccountId"
+
+  CustomLambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-CustomLambdaResourceRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: !Sub "${ProjectName}-CustomLambdaResourcePolicy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 's3:PutObject'
+                  - 's3:ListBucket'
+                  - 's3:DeleteObject'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3BucketName}'
+                  - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+
+  CustomResourceLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: 'index.lambda_handler'
+      Timeout: 900
+      Role: !GetAtt CustomLambdaExecutionRole.Arn
+      Runtime: 'python3.10'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          s3_client = boto3.client('s3')
+
+          def lambda_handler(event, context):
+              request_type = event['RequestType']
+              bucket_name = event['ResourceProperties']['BucketName']
+              folder1 = 'sourcefiles/'
+              folder2 = 'transcribedfiles/'
+
+              try:
+                  if request_type == 'Create':
+                      # Create folders
+                      create_folder(bucket_name, folder1)
+                      create_folder(bucket_name, folder2)
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, "CustomResourcePhysicalID")
+                  
+                  elif request_type == 'Delete':
+                      # Delete all files and folders
+                      delete_all_objects(bucket_name)
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, "CustomResourcePhysicalID")
+
+              except Exception as e:
+                  print(f"Error processing request: {e}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, "CustomResourcePhysicalID")
+
+          def create_folder(bucket_name, folder_name):
+              s3_client.put_object(Bucket=bucket_name, Key=folder_name)
+
+          def delete_all_objects(bucket_name):
+              objects = s3_client.list_objects_v2(Bucket=bucket_name)
+              if 'Contents' in objects:
+                  object_keys = [{'Key': obj['Key']} for obj in objects['Contents']]
+                  s3_client.delete_objects(Bucket=bucket_name, Delete={'Objects': object_keys})
+
+  CustomResource:
+    Type: 'Custom::S3FolderManagement'
+    Properties:
+      ServiceToken: !GetAtt CustomResourceLambda.Arn
+      BucketName: !Ref S3Bucket
