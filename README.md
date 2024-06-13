@@ -23,11 +23,11 @@ This CloudFormation template sets up an S3 bucket, a Lambda function, and a Dyna
 
 2. **Upload Audio Files**: Upload audio files to the `sourcefiles/` folder in the S3 bucket to trigger the Lambda function.
 
-3. **Monitor Processing**: Check the Lambda function logs and the DynamoDB table to monitor the progress and results of the sentiment analysis.
+3. **Monitor Processing**: Check the DynamoDB table to monitor the progress and results of the sentiment analysis.
 
 ## Sample DynamoDB Output
 
-![DynamoDB Output](dynamodb.png)
+![DynamoDB Output](sample_dynamodb_output.png)
 
 ## Detailed Resource Information
 
@@ -47,7 +47,7 @@ The function uses the following environment variables:
 
 ### DynamoDB Table
 
-The DynamoDB table named `${ProjectName}-FileTracker` stores the status of each file processed, along with the results of the sentiment analysis.
+The DynamoDB table named `<ProjectName>-FileTracker` stores the status of each file processed, along with the results of the sentiment analysis.
 
 ### IAM Roles
 
