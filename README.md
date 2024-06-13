@@ -1,6 +1,6 @@
 # Audio Sentiment Analysis CloudFormation Template
 
-This CloudFormation template sets up an S3 bucket, a Lambda function, and a DynamoDB table for an audio sentiment analysis project. The S3 bucket triggers the Lambda function when new audio files are uploaded, which transcribes the audio and performs sentiment analysis, storing the results in DynamoDB.
+This CloudFormation template sets up a S3 bucket, a Lambda function, and a DynamoDB table for an audio sentiment analysis project. The S3 bucket triggers the Lambda function when new audio files are uploaded, which transcribes the audio and performs sentiment analysis, storing the results in DynamoDB.
 
 ## Architecture
 
